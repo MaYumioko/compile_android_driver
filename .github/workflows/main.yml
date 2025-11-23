@@ -1,40 +1,128 @@
-name: Android Kernel Driver Builder
+name: Android Kernel Driver Builder (A15-6.6 Shallow)
 
 on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: 'Android Version (Kernel) (e.g., 14)'
+        description: 'Android Version'
         required: true
+        default: '15'
       kernel_version:
-        description: 'Kernel Version (e.g., 6.1)'
+        description: 'Kernel Version'
         required: true
+        default: '6.6'
       driver_name:
         description: 'Driver Module Name (e.g., mydriver.ko)'
         required: true
       target_arch:
-        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        description: 'Target Architecture'
         required: true
         default: 'aarch64'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+    # 增加存储空间（可选，如果代码量极大）
+    # runs-on: ubuntu-24.04 # 使用较新的 runner 环境
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
-        
+        with:
+          fetch-depth: 1 # 只拉取当前仓库的最新代码
+
       - name: Prepare kerneldriver directory
         run: |
           mkdir kerneldriver
+          # 移动你的源码到临时目录，确保 code 文件夹存在
           mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
-          
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 git curl
+
       - name: Install repo tool
         run: |
           sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
           sudo chmod a+x /usr/local/bin/repo
 
+      - name: Initialize and Sync Kernel Source (Latest Only)
+        run: |
+          mkdir -p android-kernel && cd android-kernel
+          
+          # 配置 git 以避免交互式提示
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          
+          BRANCH="common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}"
+          echo "Target Branch: $BRANCH"
+
+          # 重点优化：
+          # --depth=1 : 浅克隆，只取最近一次提交
+          # -u : 指定 manifest URL
+          # -b : 指定分支
+          repo init -u https://android.googlesource.com/kernel/manifest -b $BRANCH --depth=1
+          
+          # 重点优化：
+          # -c : 只同步当前分支
+          # --no-tags : 不拉取 tags
+          # --no-clone-bundle : 避免下载大的 bundle 包，直接从 git 拉取浅层数据
+          # -j$(nproc) : 并发下载
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --optimized-fetch --prune
+
+      - name: Integrate Driver Source
+        run: |
+          cd android-kernel
+          # 复制驱动代码到内核源码树
+          cp -r ../kerneldriver common/drivers/
+          
+          # 修改 Makefile 将驱动加入编译树
+          # 注意：这里使用 obj-y 确保 Bazel 能扫描到，但它是模块代码，最终会编成 .ko
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+
+      - name: Register Module in GKI List (Kleaf/Bazel)
+        run: |
+          cd android-kernel
+          MODULE_PATH="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          
+          # Android 15 使用 modules.bzl 管理 GKI 模块
+          # 我们使用 sed 将模块路径插入到 _COMMON_GKI_MODULES_LIST 列表开头
+          if [ -f "common/modules.bzl" ]; then
+            echo "Injecting module into common/modules.bzl..."
+            # 查找列表定义的下一行并插入
+            sed -i "/_COMMON_GKI_MODULES_LIST = \[/a \    \"$MODULE_PATH\"," common/modules.bzl
+          else
+            echo "::warning::common/modules.bzl not found. Build might skip packaging the module."
+          fi
+
+      - name: Increase Stack Frame Warning Limit
+        run: |
+          cd android-kernel
+          # 防止部分驱动因为代码写法导致的栈溢出警告当做错误处理
+          find common -name "Makefile" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+
+      - name: Build with Bazel (Kleaf)
+        run: |
+          cd android-kernel
+          echo "Building kernel dist..."
+          
+          # Android 15 标准构建命令
+          # --allow_undeclared_modules: 允许未在 BUILD 文件显式声明的模块（对注入的驱动很重要）
+          # --lto=thin: 使用 ThinLTO 加快构建速度
+          tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist \
+            -- --dist_dir=out/dist --allow_undeclared_modules
+            
+          echo "OUTPUT_DIR=out/dist" >> $GITHUB_ENV
+
+      - name: Upload Driver Artifacts
+        uses: actions/upload-artifact@v4.6.2
+        if: always() # 即使构建部分失败，如果产物存在也尝试上传
+        with:
+          name: driver-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+          path: |
+            android-kernel/${{ env.OUTPUT_DIR }}/*.ko
+            android-kernel/${{ env.OUTPUT_DIR }}/System.map
       - name: Set up Android Kernel source
         run: |
           mkdir -p android-kernel && cd android-kernel
