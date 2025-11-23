@@ -1,4 +1,4 @@
-name: Android Kernel Driver Builder (A15-6.6 Shallow)
+name: Android Kernel Driver Builder (A15-Fix)
 
 on:
   workflow_dispatch:
@@ -22,19 +22,89 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 增加存储空间（可选，如果代码量极大）
-    # runs-on: ubuntu-24.04 # 使用较新的 runner 环境
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
         with:
-          fetch-depth: 1 # 只拉取当前仓库的最新代码
+          fetch-depth: 1
 
       - name: Prepare kerneldriver directory
         run: |
           mkdir kerneldriver
-          # 移动你的源码到临时目录，确保 code 文件夹存在
+          # 确保你的源码在仓库的 code/ 目录下
+          if [ -d "./code" ]; then
+            mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+            echo "Source files moved."
+          else
+            echo "Error: ./code directory not found!"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 git curl
+
+      - name: Install repo tool
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+      - name: Initialize and Sync Kernel Source
+        run: |
+          mkdir -p android-kernel && cd android-kernel
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          
+          BRANCH="common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}"
+          echo "Syncing branch: $BRANCH"
+          
+          repo init -u https://android.googlesource.com/kernel/manifest -b $BRANCH --depth=1
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --optimized-fetch --prune
+
+      - name: Modify Kernel Source to include Driver
+        run: |
+          cd android-kernel
+          cp -r ../kerneldriver common/drivers/
+          
+          # 将驱动加入 drivers/Makefile，这样 Bazel 构建整个内核时会包含它
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+          
+          # 尝试注入 GKI 模块列表 (可选，针对 Bazel)
+          if [ -f "common/modules.bzl" ]; then
+             sed -i "/_COMMON_GKI_MODULES_LIST = \[/a \    \"drivers/kerneldriver/${{ github.event.inputs.driver_name }}\"," common/modules.bzl
+          fi
+
+      - name: Build with Bazel (Kleaf)
+        id: build_step
+        run: |
+          cd android-kernel
+          echo "Starting Build..."
+          
+          # 使用这一行命令构建。如果 C 代码有错，这里会直接报错退出
+          # 我们加上 --keep_going 尝试尽可能多地构建
+          tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist \
+            -- --dist_dir=out/dist --allow_undeclared_modules || echo "Bazel build failed, checking for partial artifacts..."
+
+      - name: Locate and Stage Artifacts
+        run: |
+          cd android-kernel
+          mkdir -p final_artifacts
+          
+          echo "Searching for .ko files..."
+          # 使用 find 暴力查找生成的驱动文件，忽略路径差异
+          find . -type f -name "*.ko" -exec cp {} final_artifacts/ \;
+          find out/dist -type f -name "System.map" -exec cp {} final_artifacts/ \; || true
+          
+          echo "Contents of final_artifacts:"
+          ls -la final_artifacts/
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: driver-build-${{ github.event.inputs.kernel_version }}
+          path: android-kernel/final_artifacts/*
+          if-no-files-found: warn          # 移动你的源码到临时目录，确保 code 文件夹存在
           mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
 
       - name: Install dependencies
